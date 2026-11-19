@@ -23,7 +23,7 @@ tracks:
     patches: null
     release_inc: '0'
     release_repo_url: https://github.com/ros2-gbp/polka-release.git
-    release_tag: :{version}
+    release_tag: v:{version}
     ros_distro: humble
     vcs_type: git
     vcs_uri: https://github.com/Pana1v/polka.git
@@ -51,7 +51,7 @@ tracks:
     patches: null
     release_inc: '0'
     release_repo_url: https://github.com/ros2-gbp/polka-release.git
-    release_tag: :{version}
+    release_tag: v:{version}
     ros_distro: iron
     vcs_type: git
     vcs_uri: https://github.com/Pana1v/polka.git
@@ -79,7 +79,7 @@ tracks:
     patches: null
     release_inc: '0'
     release_repo_url: https://github.com/ros2-gbp/polka-release.git
-    release_tag: :{version}
+    release_tag: v:{version}
     ros_distro: jazzy
     vcs_type: git
     vcs_uri: https://github.com/Pana1v/polka.git
@@ -107,7 +107,7 @@ tracks:
     patches: null
     release_inc: '0'
     release_repo_url: https://github.com/ros2-gbp/polka-release.git
-    release_tag: :{version}
+    release_tag: v:{version}
     ros_distro: kilted
     vcs_type: git
     vcs_uri: https://github.com/Pana1v/polka.git
@@ -137,7 +137,7 @@ tracks:
     patches: null
     release_inc: '0'
     release_repo_url: https://github.com/ros2-gbp/polka-release.git
-    release_tag: :{version}
+    release_tag: v:{version}
     ros_distro: lyrical
     vcs_type: git
     vcs_uri: https://github.com/Pana1v/polka.git
@@ -167,7 +167,7 @@ tracks:
     patches: null
     release_inc: '0'
     release_repo_url: https://github.com/ros2-gbp/polka-release.git
-    release_tag: :{version}
+    release_tag: v:{version}
     ros_distro: rolling
     vcs_type: git
     vcs_uri: https://github.com/Pana1v/polka.git
