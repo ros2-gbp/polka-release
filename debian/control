@@ -1,0 +1,13 @@
+Source: ros-lyrical-polka
+Section: misc
+Priority: optional
+Maintainer: "Panav Arpit Raaj" <praajarpit@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), libeigen3-dev, libpcl-dev, ros-lyrical-ament-cmake, ros-lyrical-ament-cmake-gtest <!nocheck>, ros-lyrical-ament-lint-auto <!nocheck>, ros-lyrical-ament-lint-common <!nocheck>, ros-lyrical-diagnostic-msgs, ros-lyrical-laser-geometry, ros-lyrical-nav-msgs, ros-lyrical-pcl-conversions, ros-lyrical-point-cloud-transport, ros-lyrical-rclcpp, ros-lyrical-rclcpp-components, ros-lyrical-rosbag2-cpp <!nocheck>, ros-lyrical-rosbag2-storage-mcap <!nocheck>, ros-lyrical-sensor-msgs, ros-lyrical-tf2-eigen, ros-lyrical-tf2-geometry-msgs, ros-lyrical-tf2-msgs <!nocheck>, ros-lyrical-tf2-ros, ros-lyrical-ros-workspace
+Homepage: https://github.com/Pana1v/polka
+Standards-Version: 3.9.2
+
+Package: ros-lyrical-polka
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libeigen3-dev, libpcl-dev, ros-lyrical-diagnostic-msgs, ros-lyrical-laser-geometry, ros-lyrical-nav-msgs, ros-lyrical-pcl-conversions, ros-lyrical-point-cloud-transport, ros-lyrical-rcl-interfaces, ros-lyrical-rclcpp, ros-lyrical-rclcpp-components, ros-lyrical-rclpy, ros-lyrical-sensor-msgs, ros-lyrical-tf2-eigen, ros-lyrical-tf2-geometry-msgs, ros-lyrical-tf2-ros, ros-lyrical-ros-workspace
+Description: ROS 2 composable node for multi-LiDAR fusion with optional CUDA acceleration.
+ Packages from https://polka-ros.github.io include the CUDA merge engine and fall back to CPU without a GPU; ROS build farm packages are CPU-only.
