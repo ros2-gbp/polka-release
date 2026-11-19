@@ -1,0 +1,13 @@
+Source: ros-rolling-polka
+Section: misc
+Priority: optional
+Maintainer: "Panav Arpit Raaj" <praajarpit@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), libeigen3-dev, libpcl-dev, ros-rolling-ament-cmake, ros-rolling-ament-cmake-gtest <!nocheck>, ros-rolling-ament-lint-auto <!nocheck>, ros-rolling-ament-lint-common <!nocheck>, ros-rolling-diagnostic-msgs, ros-rolling-laser-geometry, ros-rolling-nav-msgs, ros-rolling-pcl-conversions, ros-rolling-point-cloud-transport, ros-rolling-rclcpp, ros-rolling-rclcpp-components, ros-rolling-rosbag2-cpp <!nocheck>, ros-rolling-rosbag2-storage-mcap <!nocheck>, ros-rolling-sensor-msgs, ros-rolling-tf2-eigen, ros-rolling-tf2-geometry-msgs, ros-rolling-tf2-msgs <!nocheck>, ros-rolling-tf2-ros, ros-rolling-ros-workspace
+Homepage: https://github.com/Pana1v/polka
+Standards-Version: 3.9.2
+
+Package: ros-rolling-polka
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libeigen3-dev, libpcl-dev, ros-rolling-diagnostic-msgs, ros-rolling-laser-geometry, ros-rolling-nav-msgs, ros-rolling-pcl-conversions, ros-rolling-point-cloud-transport, ros-rolling-rcl-interfaces, ros-rolling-rclcpp, ros-rolling-rclcpp-components, ros-rolling-rclpy, ros-rolling-sensor-msgs, ros-rolling-tf2-eigen, ros-rolling-tf2-geometry-msgs, ros-rolling-tf2-ros, ros-rolling-ros-workspace
+Description: ROS 2 composable node for multi-LiDAR fusion with optional CUDA acceleration.
+ Packages from https://polka-ros.github.io include the CUDA merge engine and fall back to CPU without a GPU; ROS build farm packages are CPU-only.
