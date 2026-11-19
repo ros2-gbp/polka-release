@@ -1,0 +1,645 @@
+// Copyright 2025 Panav Arpit Raaj <praajarpit@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "polka/input/source_adapter.hpp"
+
+#include <pcl_conversions/pcl_conversions.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "polka/util/log_format.hpp"
+#include "polka/util/se3_exp.hpp"
+#include "polka/filters/filter_chain.hpp"
+#include <sensor_msgs/msg/point_field.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
+
+namespace polka
+{
+
+namespace
+{
+// Largest angle a point is stepped from its anchor to first order (see AnchorTable).
+constexpr double kMaxInterpAngleRad = 2e-3;
+// Most anchors one scan builds. Beyond this the spacing widens, and points whose
+// nearest anchor is out of bounds take the exact formula.
+constexpr size_t kMaxAnchors = 4096;
+// Scan-wide translation below this is dropped in favour of the rotation-only path.
+constexpr double kNegligibleTranslationM = 1e-3;
+// Largest translation error the SE(3) path accepts from holding the translation
+// Jacobian V between anchors (about dtheta * |rho| / 2).
+constexpr double kMaxInterpTranslationErrM = 1e-4;
+// Below these, angular rate / per-point angle counts as zero.
+constexpr double kMinAngularRate = 1e-10;
+constexpr double kMinAngle = 1e-9;
+
+// R(theta) by Rodrigues, and the SO(3) left Jacobian V(theta) when V is given, about
+// the axis whose skew matrix is K. 1 - cos(theta) is taken as 2 sin^2(theta / 2) so
+// small angles keep precision.
+void rotation_and_jacobian(
+  float theta, const Eigen::Matrix3f & K, const Eigen::Matrix3f & K2,
+  Eigen::Matrix3f & R, Eigen::Matrix3f * V)
+{
+  R.setIdentity();
+  if (V) {V->setIdentity();}
+  if (std::abs(theta) <= kMinAngle) {return;}
+
+  const float sin_half = std::sin(0.5f * theta);
+  const float cos_half = std::cos(0.5f * theta);
+  const float s = 2.0f * sin_half * cos_half;
+  const float one_minus_c = 2.0f * sin_half * sin_half;
+  R += s * K + one_minus_c * K2;
+  if (V) {*V += (one_minus_c / theta) * K + ((theta - s) / theta) * K2;}
+}
+
+// Exact R (and V) at evenly spaced angles across one scan. Each point takes its
+// nearest anchor and steps to first order:
+//   R(theta) p ~= R_a (p + dtheta k x p),   V(theta) rho ~= V_a rho.
+// Work per point then depends on neither point order nor scan pattern: column-major
+// spinning, row-timed vertical sweeps and unordered clouds all cost the same.
+//
+//   theta:   theta_min ----a0----a1----a2---- ... ----aN---- theta_max
+//   point:                      ^ nearest anchor, |dtheta| <= spacing / 2
+class AnchorTable
+{
+public:
+  enum class Jacobian { SKIP, BUILD };
+
+  AnchorTable(
+    float theta_min, float theta_max, float max_step,
+    const Eigen::Matrix3f & K, const Eigen::Matrix3f & K2, Jacobian jacobian)
+  : theta0_(theta_min)
+  {
+    const float span = std::max(0.0f, theta_max - theta_min);
+    size_t count = static_cast<size_t>(std::ceil(span / (2.0f * max_step))) + 1;
+    count = std::min(count, kMaxAnchors);
+    spacing_ = count > 1 ? span / static_cast<float>(count - 1) : 1.0f;
+    inv_spacing_ = 1.0f / spacing_;
+
+    R_.resize(count);
+    if (jacobian == Jacobian::BUILD) {V_.resize(count);}
+    for (size_t a = 0; a < count; ++a) {
+      rotation_and_jacobian(
+        theta_at(a), K, K2, R_[a], jacobian == Jacobian::BUILD ? &V_[a] : nullptr);
+    }
+  }
+
+  // Index of the anchor nearest theta, clamped to the table.
+  size_t nearest(float theta) const
+  {
+    const float x = (theta - theta0_) * inv_spacing_ + 0.5f;
+    if (x <= 0.0f) {return 0;}
+    return std::min(static_cast<size_t>(x), R_.size() - 1);
+  }
+
+  float theta_at(size_t a) const {return theta0_ + spacing_ * static_cast<float>(a);}
+  const Eigen::Matrix3f & R(size_t a) const {return R_[a];}
+  const Eigen::Matrix3f & V(size_t a) const {return V_[a];}
+
+private:
+  float theta0_;
+  float spacing_ = 1.0f;
+  float inv_spacing_ = 1.0f;
+  std::vector<Eigen::Matrix3f> R_;
+  std::vector<Eigen::Matrix3f> V_;
+};
+
+// True when 'data' actually holds every point the message claims, so walking it
+// by point_step cannot run off the end. Every raw-byte read of the per-point time
+// field is gated on this.
+bool payload_indexable(const sensor_msgs::msg::PointCloud2 & msg)
+{
+  const size_t n = static_cast<size_t>(msg.width) * msg.height;
+  return msg.point_step > 0 && msg.data.size() >= n * msg.point_step;
+}
+}  // namespace
+
+SourceAdapter::SourceAdapter(
+  rclcpp::Node * node, const SourceConfig & config, bool gpu_filters,
+  ImuGetter imu_getter, bool deskew_enabled,
+  const std::string & timestamp_field_hint,
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer,
+  int imu_buffer_size,
+  TranslationMode translation,
+  TwistGetter twist_getter)
+: node_(node), config_(config), logger_(node->get_logger()), gpu_filters_(gpu_filters),
+  get_imu_(std::move(imu_getter)), get_twist_(std::move(twist_getter)),
+  translation_(translation), deskew_enabled_(deskew_enabled),
+  timestamp_field_hint_(timestamp_field_hint), tf_buffer_(std::move(tf_buffer))
+{
+  // Per-source IMU: if configured, create a local buffer and override the getter
+  if (deskew_enabled_ && !config.imu_topic.empty()) {
+    local_imu_ = std::make_shared<ImuBuffer>(node, config.imu_topic, imu_buffer_size);
+    get_imu_ = [this](const rclcpp::Time & from, const rclcpp::Time & to) {
+        return local_imu_->average(from, to);
+      };
+    RCLCPP_INFO(
+      logger_, "polka: source '%s' using per-source IMU on '%s'",
+      config.name.c_str(), config.imu_topic.c_str());
+  }
+  // Build QoS
+  rclcpp::QoS qos(config.qos_history_depth);
+  if (config.qos_reliability == "best_effort") {
+    qos.reliability(rclcpp::ReliabilityPolicy::BestEffort);
+  } else {
+    qos.reliability(rclcpp::ReliabilityPolicy::Reliable);
+  }
+
+  // Create subscription based on source type
+  if (config.type == SourceType::POINTCLOUD2) {
+    pc2_sub_ = create_cloud_subscription(
+      node_, config.topic, qos,
+      std::bind(&SourceAdapter::pc2_callback, this, std::placeholders::_1));
+  } else {
+    scan_sub_ = node_->create_subscription<sensor_msgs::msg::LaserScan>(
+      config.topic, qos,
+      std::bind(&SourceAdapter::scan_callback, this, std::placeholders::_1));
+  }
+
+  if (!gpu_filters_) {
+    filters_ = build_filter_chain(config.filter_params);
+  }
+
+  RCLCPP_INFO(
+    logger_, "polka: source '%s' subscribed to '%s' (%s), %zu filters%s",
+    config.name.c_str(), config.topic.c_str(),
+    config.type == SourceType::POINTCLOUD2 ? "PointCloud2" : "LaserScan",
+    filters_.size(),
+    deskew_enabled_ ? ", deskewing enabled" : "");
+}
+
+bool SourceAdapter::validate_fields(const sensor_msgs::msg::PointCloud2 & msg)
+{
+  bool has_x = false, has_y = false, has_z = false, has_intensity = false;
+  for (const auto & field : msg.fields) {
+    if (field.name == "x" && field.datatype == sensor_msgs::msg::PointField::FLOAT32) {
+      has_x = true;
+    }
+    if (field.name == "y" && field.datatype == sensor_msgs::msg::PointField::FLOAT32) {
+      has_y = true;
+    }
+    if (field.name == "z" && field.datatype == sensor_msgs::msg::PointField::FLOAT32) {
+      has_z = true;
+    }
+    if (field.name == "intensity") {has_intensity = true;}
+  }
+  if (!has_x || !has_y || !has_z) {
+    RCLCPP_ERROR(
+      logger_,
+      "polka: source '%s' missing required FLOAT32 x/y/z fields - dropping all messages",
+      config_.name.c_str());
+    return false;
+  }
+  missing_intensity_ = !has_intensity;
+  if (missing_intensity_) {
+    RCLCPP_WARN(
+      logger_,
+      "polka: source '%s' missing 'intensity' field - publishing with intensity=0",
+      config_.name.c_str());
+  }
+  return true;
+}
+
+void SourceAdapter::detect_timestamp_field(const sensor_msgs::msg::PointCloud2 & msg)
+{
+  timestamp_field_detected_ = true;
+  has_timestamp_field_ = false;
+
+  std::string matched_name;
+  const auto decoder = detect_point_time_field(msg.fields, timestamp_field_hint_, &matched_name);
+
+  if (!decoder) {
+    RCLCPP_INFO(
+      logger_,
+      "polka: source '%s' has no per-point timestamp field, per-point deskewing disabled",
+      config_.name.c_str());
+    return;
+  }
+
+  // Boundary check: a driver we guessed wrong about produces dt values orders of
+  // magnitude too large. Deskewing on those would fling points across the map, so
+  // refuse the field instead. Only meaningful for the float paths - a UINT32 ns
+  // field is capped by its own type at 4.295 s.
+  const size_t n = static_cast<size_t>(msg.width) * msg.height;
+  const double header_sec = rclcpp::Time(msg.header.stamp).seconds();
+
+  const double max_abs_dt = payload_indexable(msg) ?
+    point_time_max_abs_dt(*decoder, msg.data.data(), msg.point_step, n, header_sec) :
+    0.0;
+
+  if (max_abs_dt > kMaxPlausibleAbsDtSec) {
+    RCLCPP_WARN(
+      logger_,
+      "polka: source '%s' per-point timestamp field '%s' (%s) decodes to "
+      "max|dt| = %.3f s, over the %.1f s plausibility bound (header %.6f s). "
+      "Units or epoch are misread - per-point deskewing and timestamp "
+      "passthrough disabled for this source.",
+      config_.name.c_str(), matched_name.c_str(),
+      point_time_datatype_name(decoder->datatype),
+      max_abs_dt, kMaxPlausibleAbsDtSec, header_sec);
+    return;
+  }
+
+  decoder_ = *decoder;
+  has_timestamp_field_ = true;
+
+  RCLCPP_INFO(
+    logger_,
+    "polka: source '%s' detected per-point timestamp field '%s' (offset=%u, %s)",
+    config_.name.c_str(), matched_name.c_str(), decoder_.offset,
+    point_time_datatype_name(decoder_.datatype));
+}
+
+void SourceAdapter::populate_point_time(
+  CloudT & cloud,
+  const sensor_msgs::msg::PointCloud2 & raw_msg)
+{
+  const size_t n = cloud.size();
+  const double header_sec = rclcpp::Time(raw_msg.header.stamp).seconds();
+
+  // No per-point field (or layout we cannot index safely): every point inherits
+  // the message header stamp. Same fallback used for projected LaserScan sources.
+  if (!has_timestamp_field_ ||
+    n != static_cast<size_t>(raw_msg.width) * raw_msg.height ||
+    !payload_indexable(raw_msg))
+  {
+    for (size_t i = 0; i < n; ++i) {
+      cloud[i].time = header_sec;
+    }
+    return;
+  }
+
+  const uint8_t * raw_data = raw_msg.data.data();
+  const uint32_t point_step = raw_msg.point_step;
+
+  for (size_t i = 0; i < n; ++i) {
+    cloud[i].time = header_sec + decoder_.dt(raw_data + i * point_step, header_sec);
+  }
+}
+
+void SourceAdapter::deskew_cloud(
+  CloudT & cloud,
+  const sensor_msgs::msg::PointCloud2 & raw_msg)
+{
+  size_t n = cloud.size();
+  if (n == 0 || n != static_cast<size_t>(raw_msg.width) * raw_msg.height ||
+    !payload_indexable(raw_msg))
+  {
+    return;
+  }
+
+  const rclcpp::Time header_stamp(raw_msg.header.stamp);
+  const double header_sec = header_stamp.seconds();
+  const uint8_t * raw_data = raw_msg.data.data();
+  const uint32_t point_step = raw_msg.point_step;
+
+  // Motion averaged over this scan's own time span, so one shock sample after
+  // the scan (a bump, a rail gap) cannot skew every point.
+  const DtRange dt_range = point_time_dt_range(decoder_, raw_data, point_step, n, header_sec);
+  const rclcpp::Time scan_from = header_stamp + rclcpp::Duration::from_seconds(dt_range.min);
+  const rclcpp::Time scan_to = header_stamp + rclcpp::Duration::from_seconds(dt_range.max);
+  const auto imu_ptr = get_imu_(scan_from, scan_to);
+  if (!imu_ptr || !imu_ptr->valid) {return;}
+  const AveragedImu & imu = *imu_ptr;
+
+  // Rotate IMU data from IMU frame into sensor frame (identity if same frame or TF unavailable).
+  // The frame comes from this message: frame_id_ is only stored after the first cloud.
+  Eigen::Matrix3d R_imu_to_sensor = Eigen::Matrix3d::Identity();
+  if (tf_buffer_ && !imu.frame_id.empty()) {
+    const std::string & sensor_frame = raw_msg.header.frame_id;
+    if (!sensor_frame.empty() && sensor_frame != imu.frame_id) {
+      try {
+        auto tf_msg = tf_buffer_->lookupTransform(
+          sensor_frame, imu.frame_id, tf2::TimePointZero);
+        R_imu_to_sensor = tf2::transformToEigen(tf_msg.transform).rotation();
+      } catch (const tf2::TransformException &) {
+        // Identity fallback — same behavior as before TF rotation was added
+      }
+    }
+  }
+
+  const Eigen::Vector3d angular_vel = R_imu_to_sensor * imu.angular_vel;
+
+  // Translation source. Exactly one of velocity / accel is non-zero.
+  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+  Eigen::Vector3d accel = Eigen::Vector3d::Zero();
+  switch (translation_) {
+    case TranslationMode::NONE:
+      break;
+    case TranslationMode::IMU_ACCEL:
+      accel = R_imu_to_sensor * imu.linear_accel;
+      break;
+    case TranslationMode::ODOMETRY:
+      velocity = sensor_velocity(raw_msg.header.frame_id, scan_from, scan_to);
+      break;
+  }
+
+  // Each point moves by the sensor motion between header time and its own capture
+  // time (dt may be negative): p_header = exp(dt * twist) * p. angular_vel is one
+  // fixed snapshot for the whole scan, so every rotation shares one axis and its
+  // signed angle is exactly linear in dt.
+  //
+  // Per-point math runs in float, like the points themselves: dt is formed in
+  // double first, so only small, well-conditioned values are narrowed. Float
+  // sin/cos is what makes this about 2x cheaper than double.
+  const double omega_mag = angular_vel.norm();
+  const Eigen::Vector3f axis = omega_mag > kMinAngularRate ?
+    Eigen::Vector3f((angular_vel / omega_mag).cast<float>()) : Eigen::Vector3f::UnitZ();
+  const float omega_f = static_cast<float>(omega_mag);
+  const Eigen::Vector3f velocity_f = velocity.cast<float>();
+  const Eigen::Vector3f half_accel = (0.5 * accel).cast<float>();
+
+  // Translation under this model is v * dt + 0.5 * a * dt^2. When that stays
+  // below a millimetre over the whole scan (0.2 m/s^2 from rest over 0.1 s gives
+  // 1 mm), drop it and take the rotation-only path.
+  const double dt_max = std::max(std::abs(dt_range.min), std::abs(dt_range.max));
+  const bool rotation_only =
+    velocity.norm() * dt_max + 0.5 * accel.norm() * dt_max * dt_max < kNegligibleTranslationM;
+
+  const Eigen::Matrix3f K = (Eigen::Matrix3f() <<
+    0.0f, -axis.z(), axis.y(),
+    axis.z(), 0.0f, -axis.x(),
+    -axis.y(), axis.x(), 0.0f).finished();
+  const Eigen::Matrix3f K2 = K * K;
+  const float theta_min = omega_f * static_cast<float>(dt_range.min);
+  const float theta_max = omega_f * static_cast<float>(dt_range.max);
+
+  if (rotation_only) {
+    if (omega_mag <= kMinAngularRate) {return;}
+
+    // First-order step from the nearest anchor errs by about r * dtheta^2 / 2:
+    // 0.2 mm at 100 m for dtheta = kMaxInterpAngleRad. A point the sampled time
+    // span missed lands past the table's end and takes the exact rotation.
+    const float max_step = static_cast<float>(kMaxInterpAngleRad);
+    const AnchorTable anchors(
+      theta_min, theta_max, max_step, K, K2, AnchorTable::Jacobian::SKIP);
+    Eigen::Matrix3f R_exact;
+
+    for (size_t i = 0; i < n; ++i) {
+      const double dt = decoder_.dt(raw_data + i * point_step, header_sec);
+      if (std::abs(dt) < 1e-9) {continue;}
+
+      const float theta = omega_f * static_cast<float>(dt);
+      const Eigen::Vector3f p(cloud[i].x, cloud[i].y, cloud[i].z);
+      const size_t a = anchors.nearest(theta);
+      const float dtheta = theta - anchors.theta_at(a);
+
+      Eigen::Vector3f corrected;
+      if (std::abs(dtheta) <= max_step) {
+        corrected = anchors.R(a) * (p + dtheta * axis.cross(p));
+      } else {
+        rotation_and_jacobian(theta, K, K2, R_exact, nullptr);
+        corrected = R_exact * p;
+      }
+
+      cloud[i].x = corrected.x();
+      cloud[i].y = corrected.y();
+      cloud[i].z = corrected.z();
+    }
+    return;
+  }
+
+  // Full SE(3): p_header = R(theta) p + V(theta) rho, with
+  // rho = v * dt + 0.5 * a * dt^2, R by Rodrigues and V the SO(3) left Jacobian,
+  // both about the fixed axis, from the same anchor table. Holding V at the anchor
+  // errs by about dtheta * |rho| / 2, so the spacing also shrinks until that stays
+  // under kMaxInterpTranslationErrM: unchanged on a ground robot (|rho| of
+  // centimetres), finer at road speed (|rho| of metres). rho stays exact per point.
+  const double rho_max = velocity.norm() * dt_max + 0.5 * accel.norm() * dt_max * dt_max;
+  const float max_step = static_cast<float>(
+    std::min(kMaxInterpAngleRad, 2.0 * kMaxInterpTranslationErrM / rho_max));
+  const AnchorTable anchors(
+    theta_min, theta_max, max_step, K, K2, AnchorTable::Jacobian::BUILD);
+  Eigen::Matrix3f R_exact;
+  Eigen::Matrix3f V_exact;
+
+  for (size_t i = 0; i < n; ++i) {
+    const double dt = decoder_.dt(raw_data + i * point_step, header_sec);
+    if (std::abs(dt) < 1e-9) {continue;}
+
+    const float dt_f = static_cast<float>(dt);
+    const float theta = omega_f * dt_f;
+    const Eigen::Vector3f p(cloud[i].x, cloud[i].y, cloud[i].z);
+    const Eigen::Vector3f rho = (velocity_f + half_accel * dt_f) * dt_f;
+    const size_t a = anchors.nearest(theta);
+    const float dtheta = theta - anchors.theta_at(a);
+
+    Eigen::Vector3f corrected;
+    if (std::abs(dtheta) <= max_step) {
+      corrected = anchors.R(a) * (p + dtheta * axis.cross(p)) + anchors.V(a) * rho;
+    } else {
+      rotation_and_jacobian(theta, K, K2, R_exact, &V_exact);
+      corrected = R_exact * p + V_exact * rho;
+    }
+
+    cloud[i].x = corrected.x();
+    cloud[i].y = corrected.y();
+    cloud[i].z = corrected.z();
+  }
+}
+
+Eigen::Vector3d SourceAdapter::sensor_velocity(
+  const std::string & sensor_frame, const rclcpp::Time & from, const rclcpp::Time & to)
+{
+  const auto twist = get_twist_ ? get_twist_(from, to) : nullptr;
+  if (!twist || !twist->valid) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *node_->get_clock(), kLogThrottleNormalMs,
+      "polka: source '%s' has no fresh odometry twist, deskewing rotation only",
+      config_.name.c_str());
+    return Eigen::Vector3d::Zero();
+  }
+
+  // Pose of the sensor in the twist's frame, for its rotation and lever arm.
+  Eigen::Isometry3d T_twist_sensor = Eigen::Isometry3d::Identity();
+  if (!twist->frame_id.empty() && twist->frame_id != sensor_frame) {
+    try {
+      if (!tf_buffer_) {throw tf2::LookupException("no TF buffer");}
+      T_twist_sensor = tf2::transformToEigen(
+        tf_buffer_->lookupTransform(twist->frame_id, sensor_frame, tf2::TimePointZero));
+    } catch (const tf2::TransformException & ex) {
+      // A twist in the wrong frame would push points the wrong way: skip it.
+      RCLCPP_WARN_THROTTLE(
+        logger_, *node_->get_clock(), kLogThrottleNormalMs,
+        "polka: source '%s' cannot place odometry frame '%s' (%s), deskewing rotation only",
+        config_.name.c_str(), twist->frame_id.c_str(), ex.what());
+      return Eigen::Vector3d::Zero();
+    }
+  }
+
+  // On an articulated vehicle the sensor also moves within the twist's frame (a
+  // steering joint, say), which the twist cannot know about. Add that rate.
+  const Eigen::Vector3d chain_rate = lever_arm_rate(
+    twist->frame_id, sensor_frame, from, to, T_twist_sensor);
+
+  return velocity_at_frame(twist->linear, twist->angular, T_twist_sensor) +
+         T_twist_sensor.linear().transpose() * chain_rate;
+}
+
+Eigen::Vector3d SourceAdapter::lever_arm_rate(
+  const std::string & parent, const std::string & child,
+  const rclcpp::Time & from, const rclcpp::Time & to, Eigen::Isometry3d & T_mid)
+{
+  if (!tf_buffer_ || parent.empty() || parent == child) {return Eigen::Vector3d::Zero();}
+
+  // Sample the chain over a window as long as the scan, ending at the scan's end or
+  // at the newest transform before it: on a live robot the joint TF usually lags
+  // the lidar. A static chain has no newest stamp and so no rate.
+  const double span = (to - from).seconds();
+  if (span <= 0.0) {return Eigen::Vector3d::Zero();}
+
+  try {
+    const rclcpp::Time newest(
+      tf_buffer_->lookupTransform(parent, child, tf2::TimePointZero).header.stamp,
+      to.get_clock_type());
+    if (newest.nanoseconds() == 0) {return Eigen::Vector3d::Zero();}
+
+    const rclcpp::Time t2 = std::min(to, newest);
+    const rclcpp::Time t1 = t2 - rclcpp::Duration::from_seconds(span);
+    const rclcpp::Time t_mid = t2 - rclcpp::Duration::from_seconds(0.5 * span);
+    auto pose_at = [&](const rclcpp::Time & t) {
+        return tf2::transformToEigen(
+          tf_buffer_->lookupTransform(parent, child, tf2_ros::fromRclcpp(t)));
+      };
+    const Eigen::Isometry3d T1 = pose_at(t1);
+    const Eigen::Isometry3d T2 = pose_at(t2);
+    T_mid = pose_at(t_mid);
+    return (T2.translation() - T1.translation()) / span;
+  } catch (const tf2::TransformException & ex) {
+    // Not enough TF history yet: keep the newest pose, without the joint's rate.
+    RCLCPP_WARN_THROTTLE(
+      logger_, *node_->get_clock(), kLogThrottleNormalMs,
+      "polka: source '%s' cannot sample TF '%s' -> '%s' over the scan (%s), "
+      "deskewing without its rate", config_.name.c_str(), parent.c_str(), child.c_str(),
+      ex.what());
+    return Eigen::Vector3d::Zero();
+  }
+}
+
+void SourceAdapter::apply_filters(CloudT & cloud)
+{
+  for (auto & filter : filters_) {
+    filter->apply(cloud, frame_id_);
+  }
+}
+
+void SourceAdapter::store_cloud(CloudT::Ptr cloud, const std_msgs::msg::Header & header)
+{
+  {
+    std::lock_guard<std::mutex> lock(meta_mutex_);
+    frame_id_ = header.frame_id;
+    last_received_time_ = rclcpp::Time(header.stamp);
+  }
+  std::atomic_store(&buffer_, std::static_pointer_cast<CloudT>(cloud));
+  has_received_.store(true);
+  message_counter_.fetch_add(1);
+}
+
+void SourceAdapter::pc2_callback(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
+{
+  // Validate fields on first message
+  if (!fields_validated_) {
+    fields_validated_ = true;
+    fields_valid_ = validate_fields(*msg);
+  }
+  if (!fields_valid_) {return;}
+
+  // Detect per-point timestamp field on first message
+  if (!timestamp_field_detected_) {
+    detect_timestamp_field(*msg);
+  }
+
+  auto cloud = std::make_shared<CloudT>();
+  pcl::fromROSMsg(*msg, *cloud);
+
+  // Stamp each point with its absolute acquisition time before any filtering,
+  // so the 'time' field survives the same compaction as x/y/z/intensity.
+  populate_point_time(*cloud, *msg);
+
+  // Per-point deskewing (before filters, in sensor frame)
+  if (deskew_enabled_ && has_timestamp_field_ && get_imu_) {
+    deskew_cloud(*cloud, *msg);
+  }
+
+  const uint64_t points_raw = cloud->size();
+  apply_filters(*cloud);
+  // +72 approximates the fixed PointCloud2 overhead (header/fields/dims), so
+  // bandwidth tracks the application payload rather than exact wire bytes.
+  stats_.record(msg->data.size() + 72, points_raw, cloud->size());
+  store_cloud(cloud, msg->header);
+}
+
+void SourceAdapter::scan_callback(sensor_msgs::msg::LaserScan::ConstSharedPtr msg)
+{
+  // Convert LaserScan -> PointCloud2 -> CloudT
+  sensor_msgs::msg::PointCloud2 pc2_msg;
+  projector_.projectLaser(*msg, pc2_msg);
+
+  if (!fields_validated_) {
+    fields_validated_ = true;
+    fields_valid_ = validate_fields(pc2_msg);
+  }
+  if (!fields_valid_) {return;}
+
+  auto cloud = std::make_shared<CloudT>();
+  pcl::fromROSMsg(pc2_msg, *cloud);
+  // Projected scans carry no per-point time; populate falls back to header stamp.
+  populate_point_time(*cloud, pc2_msg);
+  const uint64_t points_raw = cloud->size();
+  apply_filters(*cloud);
+  // Bandwidth counts the LaserScan as received (float32 ranges/intensities
+  // + ~60 B header), not the fatter projected cloud derived from it.
+  stats_.record(
+    4 * (msg->ranges.size() + msg->intensities.size()) + 60,
+    points_raw, cloud->size());
+  store_cloud(cloud, msg->header);
+}
+
+CloudT::ConstPtr SourceAdapter::get_latest() const
+{
+  return std::atomic_load(&buffer_);
+}
+
+std::string SourceAdapter::frame_id() const
+{
+  std::lock_guard<std::mutex> lock(meta_mutex_);
+  return frame_id_;
+}
+
+bool SourceAdapter::is_stale(double timeout_sec, const rclcpp::Time & now) const
+{
+  if (!has_received_.load()) {return true;}
+  std::lock_guard<std::mutex> lock(meta_mutex_);
+  return (now - last_received_time_).seconds() > timeout_sec;
+}
+
+rclcpp::Time SourceAdapter::last_stamp() const
+{
+  std::lock_guard<std::mutex> lock(meta_mutex_);
+  return last_received_time_;
+}
+
+void SourceAdapter::rebuild_filters(const FilterParams & fp)
+{
+  config_.filter_params = fp;
+  filters_.clear();
+  if (!gpu_filters_) {
+    filters_ = build_filter_chain(fp);
+  }
+}
+
+}  // namespace polka

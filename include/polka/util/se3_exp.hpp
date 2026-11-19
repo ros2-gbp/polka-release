@@ -1,0 +1,127 @@
+// Copyright 2025 Panav Arpit Raaj <praajarpit@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// SE(3) exponential map for per-point deskewing.
+// Motion model inspired by rko_lio:
+//   M.V.R. Malladi, T. Guadagnino, L. Lobefaro, C. Stachniss,
+//   "A Robust Approach for LiDAR-Inertial Odometry Without Sensor-Specific Modeling,"
+//   arXiv:2509.06593, 2025.
+
+#ifndef POLKA__UTIL__SE3_EXP_HPP_
+#define POLKA__UTIL__SE3_EXP_HPP_
+
+#include <Eigen/Geometry>
+#include <cmath>
+
+namespace polka
+{
+
+/// Skew-symmetric matrix [v]_x such that [v]_x * w = v x w.
+inline Eigen::Matrix3d hat(const Eigen::Vector3d & v)
+{
+  Eigen::Matrix3d m;
+  m << 0, -v.z(), v.y(),
+    v.z(), 0, -v.x(),
+    -v.y(), v.x(), 0;
+  return m;
+}
+
+/// Left Jacobian V of SO(3), used in the SE(3) exponential map.
+///   V = I + (1 - cos θ)/θ² [φ]_x + (θ - sin θ)/θ³ [φ]_x²
+/// For small θ, uses Taylor expansion for numerical stability.
+inline Eigen::Matrix3d so3_left_jacobian(const Eigen::Vector3d & phi)
+{
+  double theta = phi.norm();
+  Eigen::Matrix3d Phi = hat(phi);
+
+  if (theta < 1e-10) {
+    return Eigen::Matrix3d::Identity() + 0.5 * Phi;
+  }
+
+  double theta2 = theta * theta;
+  double a = (1.0 - std::cos(theta)) / theta2;
+  double b = (theta - std::sin(theta)) / (theta2 * theta);
+
+  return Eigen::Matrix3d::Identity() + a * Phi + b * Phi * Phi;
+}
+
+/// SE(3) exponential map: twist (ρ, φ) ∈ se(3) → rigid transform ∈ SE(3).
+///   ρ: translational component
+///   φ: rotational component (axis-angle, ‖φ‖ = rotation angle)
+/// Returns T such that T.translation() = V * ρ and T.rotation() = exp(φ).
+inline Eigen::Isometry3d se3_exp(
+  const Eigen::Vector3d & rho,
+  const Eigen::Vector3d & phi)
+{
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  double theta = phi.norm();
+
+  if (theta < 1e-10) {
+    T.translation() = rho;
+    return T;
+  }
+
+  T.linear() = Eigen::AngleAxisd(theta, phi / theta).toRotationMatrix();
+  // V * 0 == 0 regardless of V, so skip the left Jacobian (norm, hat, two
+  // trig evaluations, matrix square) whenever there's no translation to
+  // apply — the common case when gravity can't be subtracted (no IMU
+  // orientation) and deskewing falls back to rotation-only.
+  if (rho.squaredNorm() > 0.0) {
+    T.translation() = so3_left_jacobian(phi) * rho;
+  }
+  return T;
+}
+
+/// Constant-velocity + constant-acceleration + constant-angular-velocity motion model.
+///   angular_vel: body-frame angular velocity w (rad/s)
+///   velocity:    body-frame linear velocity v at dt = 0 (m/s)
+///   accel:       body-frame linear acceleration a (m/s^2)
+///   dt:          time offset from reference (seconds, can be negative)
+/// Returns the SE(3) pose delta representing sensor motion over dt.
+///   Translation: rho = v dt + 1/2 a dt^2   (as rko_lio: dt times the mean velocity)
+///   Rotation:    phi = w dt
+inline Eigen::Isometry3d compute_motion_delta(
+  const Eigen::Vector3d & angular_vel,
+  const Eigen::Vector3d & velocity,
+  const Eigen::Vector3d & accel,
+  double dt)
+{
+  Eigen::Vector3d rho = (velocity + accel * (0.5 * dt)) * dt;
+  Eigen::Vector3d phi = angular_vel * dt;
+  return se3_exp(rho, phi);
+}
+
+/// Same, starting from rest: rho = 1/2 a dt^2.
+inline Eigen::Isometry3d compute_motion_delta(
+  const Eigen::Vector3d & angular_vel,
+  const Eigen::Vector3d & accel,
+  double dt)
+{
+  return compute_motion_delta(angular_vel, Eigen::Vector3d::Zero(), accel, dt);
+}
+
+/// Velocity of frame s's origin, expressed in s, on a rigid body moving with
+/// twist (v_b, w_b) given in frame b. T_bs is the pose of s in b. The lever arm
+/// matters: a lidar 0.6 m off the axis of a robot turning at 0.6 rad/s moves at
+/// 0.36 m/s with the base itself standing still.
+///   v_s = R_bs^T (v_b + w_b x t_bs)
+inline Eigen::Vector3d velocity_at_frame(
+  const Eigen::Vector3d & v_b, const Eigen::Vector3d & w_b, const Eigen::Isometry3d & T_bs)
+{
+  return T_bs.linear().transpose() * (v_b + w_b.cross(T_bs.translation()));
+}
+
+}  // namespace polka
+
+#endif  // POLKA__UTIL__SE3_EXP_HPP_

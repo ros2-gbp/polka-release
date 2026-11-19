@@ -1,0 +1,292 @@
+# ============================================================================
+# polka - full parameter reference
+# ============================================================================
+#
+# Every polka parameter with its default and an explanation. This file is a
+# documentation reference, not a starter config - copy config/example_params.yaml
+# for a minimal working setup, then pull in the blocks you need from here.
+#
+# See also config/example_articulated_imu.yaml for a per-source IMU deskewing
+# setup (rotating turret / actuated mast / hinged trailer).
+#
+# Each source needs a valid TF from its frame_id -> output_frame_id.
+# ============================================================================
+
+polka:
+  ros__parameters:
+
+    # --------------------------------------------------
+    # General
+    # --------------------------------------------------
+
+    output_frame_id: "base_link"     # all points are transformed into this frame
+    output_rate: 20.0                # Hz - merged output publish rate
+    source_timeout: 0.5              # seconds - a source older than this is stale
+    source_stale_reuse_window: 1.5   # seconds - keep merging a stale source's last cloud
+                                     # until this old (>= source_timeout), then drop it
+    enable_gpu: true                 # use CUDA GPU pipeline when available (falls back to CPU)
+    timestamp_strategy: "earliest"   # "earliest" | "latest" | "average" | "local"
+    max_source_spread_warn: 0.05     # seconds - warn if source timestamps differ by more
+
+    # Per-point timestamp passthrough. When enabled, the merged cloud carries a
+    # per-point 'time' field (float64) preserved from each source point.
+    # Disabled = legacy output (x, y, z, intensity only).
+    point_timestamps:
+      enabled: false                 # add a per-point 'time' field to the merged cloud
+      mode: "offset"                 # "offset" (sec relative to header stamp, GLIM/deskew convention)
+                                     #   | "absolute" (raw Unix sec as received from the source)
+    # Skip publishing a cloud whose output stamp equals the previous one (and do not
+    # re-publish the last cloud when no source is fresh). Prevents downstream SLAM
+    # (e.g. GLIM) from seeing two scans with an identical header.stamp. Set false to
+    # restore continuous republishing at output_rate.
+    suppress_duplicate_timestamps: true
+
+    # --------------------------------------------------
+    # Motion Compensation (IMU-based deskewing)
+    # --------------------------------------------------
+    # Corrects for robot motion during LiDAR scans. Per-point deskewing uses
+    # per-point timestamps from the LiDAR driver and the SE(3) exponential map:
+    # rotation from the IMU gyro, translation from the source chosen below, both
+    # averaged over the scan. Inter-source alignment corrects for timing offsets
+    # between different sensors with the same motion.
+    # Motion model after rko_lio (Malladi et al., 2025, arXiv:2509.06593).
+    # max_imu_age and imu_frame are still accepted but have no effect.
+
+    motion_compensation:
+      enabled: false
+      imu_topic: ""                  # sensor_msgs/Imu topic (empty = disabled)
+      imu_buffer_size: 200           # IMU history kept (~1 s at 200 Hz); must span a scan
+      translation: "imu_accel"       # where the translation during a scan comes from:
+                                     #   "none"      - rotation only (slow ground robots)
+                                     #   "imu_accel" - 0.5 * a * dt^2 from the IMU; misses
+                                     #                 steady velocity
+                                     #   "odometry"  - v * dt from odom_topic's twist
+      odom_topic: ""                 # nav_msgs/Odometry, for translation "odometry".
+                                     # Twist is read in its child_frame_id (TF to each
+                                     # lidar needed). Must not come from these clouds.
+      per_point_deskew: true         # per-point correction within each scan
+                                     # requires per-point timestamps in PointCloud2
+                                     # (auto-detects 'time', 't', 'timestamp', etc.)
+                                     # units come from the field's datatype:
+                                     #   UINT32  -> nanosecond offset (Ouster)
+                                     #   FLOAT32 -> second offset    (Velodyne)
+                                     #   FLOAT64 -> absolute Unix s  (RoboSense)
+      deskew_timestamp_field: "auto" # "auto" or specific field name (e.g. "time")
+
+    # --------------------------------------------------
+    # Diagnostics & Drift Detection
+    # --------------------------------------------------
+    # Publishes a diagnostic_msgs/DiagnosticArray on /diagnostics with one
+    # status per source (rate, bandwidth, message age, stamp offset, filter
+    # drop rate, drift flags) plus node and output summaries. Consumed by
+    # rqt_robot_monitor, diagnostic_aggregator, and `ros2 run polka
+    # polka_monitor`. Near-free (~1 KB/s), so it defaults to on.
+    #
+    # Drift flags raise only after min_ticks consecutive bad ticks and clear
+    # with hysteresis (below 80% of the threshold), so one jittery tick never
+    # flips a flag. All values are runtime-reconfigurable via `ros2 param set`.
+
+    diagnostics:
+      enabled: true
+      publish_period_sec: 1.0        # seconds between /diagnostics updates
+
+      # Timing drift - a source's stamps trending away from its peers.
+      # Tracks an EWMA of (source stamp - median stamp of fresh sources);
+      # needs at least 2 fresh sources to have a peer reference.
+      timing_drift:
+        threshold_sec: 0.1           # seconds - flag when |EWMA offset| exceeds this
+        ewma_alpha: 0.2              # smoothing factor (1.0 = no smoothing)
+        min_ticks: 5                 # consecutive ticks over threshold before raising
+
+      # Rate drift - a source publishing slower than expected ("lagging").
+      # Expected rate comes from sources.<name>.expected_rate, or is
+      # auto-baselined from the median observed rate when that is 0.
+      rate_drift:
+        sag_pct: 20.0                # percent below expected rate that counts as sagging
+        min_ticks: 5                 # consecutive sagging ticks before raising
+        baseline_sec: 10.0           # observation window for the auto-baseline
+
+    # --------------------------------------------------
+    # Outputs
+    # --------------------------------------------------
+
+    outputs:
+
+      # === Merged PointCloud2 ===
+      cloud:
+        enabled: true
+        topic: "~/merged_cloud"
+
+        # QoS profile for the published PointCloud2
+        qos:
+          reliability: "reliable"             # "best_effort" or "reliable"
+          durability: "volatile"              # "volatile" or "transient_local"
+          history_depth: 10                   # keep-last queue depth
+          liveliness: "automatic"             # "automatic", "manual_by_node", or "manual_by_topic"
+          liveliness_lease_duration_ms: 0.0   # milliseconds (0 = infinite/system default)
+          deadline_ms: 0.0                    # milliseconds (0 = infinite/no deadline)
+          lifespan_ms: 0.0                    # milliseconds (0 = infinite/no expiry)
+
+        # Post-merge filters (applied to the merged cloud before publishing)
+        # All filters are independent and applied in this order:
+        #   range -> angular -> box -> height filter -> footprint filter -> voxel
+        filters:
+
+          # Range filter - keep points within a spherical distance from the origin
+          range:
+            enabled: false
+            min: 0.1                 # meters - minimum distance
+            max: 30.0                # meters - maximum distance
+
+          # Angular filter - keep or exclude points by horizontal angle (yaw)
+          # Angles are in degrees, measured counter-clockwise from +X axis (0 = forward)
+          # Ranges are [start, end] pairs; multiple pairs can be specified
+          angular:
+            enabled: false
+            invert: false            # false = KEEP listed ranges, true = EXCLUDE them
+            ranges: [0.0, 360.0]     # degrees - pairs of [start, end]
+
+          # Box filter - keep points within an axis-aligned bounding box
+          box:
+            enabled: false
+            x_min: -20.0             # meters (behind / forward)
+            x_max:  20.0
+            y_min: -20.0             # meters (right / left)
+            y_max:  20.0
+            z_min:  -2.0             # meters (below / above)
+            z_max:   5.0
+
+        # Height filter - clip the output cloud to a z-range (in output frame)
+        # Useful for removing ground and overhead points
+        height_cap:
+          enabled: false
+          z_min: -1.0                # meters - lowest point to keep
+          z_max:  3.0                # meters - highest point to keep
+
+        # Footprint filter - remove points that hit the robot body
+        # Define one or more axis-aligned exclusion boxes (in output frame).
+        # Any point inside ANY box is removed. Name each box in box_names
+        # and define its bounds below.
+        self_filter:
+          enabled: false
+          box_names: ["chassis", "sensor_mast"]  # example; default is none
+          chassis:                   # main robot body
+            x_min: -0.30
+            x_max:  0.30
+            y_min: -0.25
+            y_max:  0.25
+            z_min: -0.10
+            z_max:  0.50
+          sensor_mast:               # vertical pole holding sensors
+            x_min: -0.05
+            x_max:  0.05
+            y_min: -0.05
+            y_max:  0.05
+            z_min:  0.50
+            z_max:  1.20
+
+        # Voxel downsampling - reduce point density uniformly
+        # Set leaf_size for uniform voxels, or leaf_x/y/z for per-axis control.
+        # Any positive leaf size turns voxelization on, even with enabled: false.
+        voxel:
+          enabled: false
+          leaf_size: 0.0             # meters - uniform voxel size (e.g. 0.05)
+          # leaf_x: 0.05             # per-axis overrides (take priority over leaf_size)
+          # leaf_y: 0.05
+          # leaf_z: 0.10
+
+      # === Merged LaserScan ===
+      # Flattens the merged 3D cloud into a 2D scan (closest point per angular bin)
+      scan:
+        enabled: false
+        topic: "~/merged_scan"
+
+        # QoS profile for the published LaserScan
+        qos:
+          reliability: "reliable"
+          durability: "volatile"
+          history_depth: 10
+          liveliness: "automatic"
+          liveliness_lease_duration_ms: 0.0
+          deadline_ms: 0.0
+          lifespan_ms: 0.0
+
+        z_min: -0.15                 # meters - bottom of horizontal slice
+        z_max:  0.15                 # meters - top of horizontal slice
+        angle_min: -3.14159265       # radians - scan start angle (full 360)
+        angle_max:  3.14159265       # radians - scan end angle
+        angle_increment: 0.00436332  # radians per bin (0.25 degrees = 1440 bins)
+        range_min: 0.10              # meters - minimum valid range
+        range_max: 100.0             # meters - maximum valid range
+
+    # --------------------------------------------------
+    # Sources
+    # --------------------------------------------------
+    # Each source is an independent LiDAR input.
+    #   type: "pointcloud2" (3D LiDAR) or "laserscan" (2D LiDAR)
+    #
+    # The two sources below are an example setup, not defaults: per-source
+    # filters default to off (range 0.1-100 m when enabled).
+    #
+    # Per-source filters run BEFORE merging, in each sensor's own frame.
+    # This lets you crop irrelevant data early (less work for the merge step).
+    # Available per-source filters: range, angular, box
+    # (same parameters as the output filters above)
+
+    source_names: ["front_3d", "rear_2d"]
+
+    sources:
+
+      # --- 3D LiDAR (PointCloud2) ---
+      front_3d:
+        topic: "/front_lidar/points"
+        type: "pointcloud2"
+        # imu_topic: "/front_lidar/imu" # per-source IMU override (empty or omitted = use global)
+                                        # useful for articulated platforms where each LiDAR
+                                        # has its own IMU; global IMU recommended for rigid platforms
+        qos_reliability: "best_effort"   # "best_effort" or "reliable"
+        qos_history_depth: 1
+        # expected_rate: 10.0            # Hz - nominal publish rate for rate-drift detection
+                                         # (0 or omitted = auto-baseline from observed rates)
+        filters:
+          # Drop self-reflections too close to the sensor
+          range:
+            enabled: true
+            min: 0.30                # meters - ignore returns within 30 cm
+            max: 25.0
+          # Keep only the front 180 degrees
+          angular:
+            enabled: true
+            invert: false
+            ranges: [270.0, 90.0]    # wraps around 0 to cover front hemisphere
+          # Not using box filter on this source
+          box:
+            enabled: false
+
+      # --- 2D LiDAR (LaserScan, auto-converted to PointCloud2) ---
+      rear_2d:
+        topic: "/rear_lidar/scan"
+        type: "laserscan"
+        # imu_topic: ""                  # falls back to motion_compensation.imu_topic
+        qos_reliability: "best_effort"
+        qos_history_depth: 1
+        filters:
+          # Tighter range for the rear sensor
+          range:
+            enabled: true
+            min: 0.20
+            max: 15.0
+          # Keep only the rear 180 degrees
+          angular:
+            enabled: true
+            invert: false
+            ranges: [90.0, 270.0]    # rear hemisphere
+          # Example: crop to a box behind the robot (disabled here)
+          box:
+            enabled: false
+            # x_min: -5.0
+            # x_max:  0.0
+            # y_min: -3.0
+            # y_max:  3.0
+            # z_min: -1.0
+            # z_max:  2.0

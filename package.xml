@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>polka</name>
+  <version>0.6.1</version>
+  <description>ROS 2 composable node for multi-LiDAR fusion with optional CUDA acceleration. Packages from https://polka-ros.github.io include the CUDA merge engine and fall back to CPU without a GPU; ROS build farm packages are CPU-only.</description>
+  <maintainer email="praajarpit@gmail.com">Panav Arpit Raaj</maintainer>
+  <license>Apache-2.0</license>
+
+  <url type="website">https://github.com/Pana1v/polka</url>
+  <url type="repository">https://github.com/Pana1v/polka</url>
+  <url type="bugtracker">https://github.com/Pana1v/polka/issues</url>
+
+  <author email="praajarpit@gmail.com">Panav Arpit Raaj</author>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>tf2_eigen</depend>
+  <depend>pcl_conversions</depend>
+  <depend>laser_geometry</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>nav_msgs</depend>
+  <!-- find_package'd directly in CMakeLists.txt. Both arrive transitively today - PCL via
+       pcl_conversions, Eigen via pcl_conversions, tf2_eigen and laser_geometry - but those
+       are dependency lists we do not control. Declare them so a change in any of them
+       cannot break the build farm. -->
+  <depend>libpcl-all-dev</depend>
+  <depend>eigen</depend>
+  <!-- Not released for Iron (permanently EOL, never got a build); polka falls back to
+       plain rclcpp PointCloud2 pub/sub there - see MAINTAINING.md and CMakeLists.txt. -->
+  <depend condition="$ROS_DISTRO != 'iron'">point_cloud_transport</depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>rosbag2_cpp</test_depend>
+  <test_depend>rosbag2_storage_mcap</test_depend>
+  <test_depend>tf2_msgs</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

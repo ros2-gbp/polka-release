@@ -1,0 +1,146 @@
+// Copyright 2025 Panav Arpit Raaj <praajarpit@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef POLKA__INPUT__SOURCE_ADAPTER_HPP_
+#define POLKA__INPUT__SOURCE_ADAPTER_HPP_
+
+#include <tf2_ros/buffer.h>
+#include <Eigen/Core>
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <atomic>
+
+#include "polka/types.hpp"
+#include "polka/diag/stat_counters.hpp"
+#include "polka/input/imu_buffer.hpp"
+#include "polka/input/odom_buffer.hpp"
+#include "polka/input/point_time_decoder.hpp"
+#include "polka/filters/i_filter.hpp"
+#include "polka/util/cloud_transport.hpp"
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
+#include <laser_geometry/laser_geometry.hpp>
+
+namespace polka
+{
+
+class SourceAdapter
+{
+public:
+  // IMU state over [from, to], the span of one scan.
+  using ImuGetter = std::function<std::shared_ptr<const AveragedImu>(
+        const rclcpp::Time & from, const rclcpp::Time & to)>;
+  // Body twist over [from, to], for TranslationMode::ODOMETRY.
+  using TwistGetter = std::function<std::shared_ptr<const BodyTwist>(
+        const rclcpp::Time & from, const rclcpp::Time & to)>;
+
+  SourceAdapter(
+    rclcpp::Node * node, const SourceConfig & config, bool gpu_filters = false,
+    ImuGetter imu_getter = nullptr, bool deskew_enabled = false,
+    const std::string & timestamp_field_hint = "auto",
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer = nullptr,
+    int imu_buffer_size = 200,
+    TranslationMode translation = TranslationMode::IMU_ACCEL,
+    TwistGetter twist_getter = nullptr);
+
+  CloudT::ConstPtr get_latest() const;
+  bool is_stale(double timeout_sec, const rclcpp::Time & now) const;
+  bool received() const {return has_received_.load();}
+  rclcpp::Time last_stamp() const;
+  std::string name() const {return config_.name;}
+  std::string frame_id() const;
+  uint64_t message_count() const {return message_counter_.load();}
+  const FilterParams & filter_params() const {return config_.filter_params;}
+  void rebuild_filters(const FilterParams & fp);
+
+  // Cumulative traffic totals for the diagnostics tick (rates are derived
+  // there by differencing successive samples).
+  StatSample stats() const {return stats_.sample();}
+  // True once a message arrived whose fields failed validation (the source
+  // drops everything from then on) - surfaced as a diagnostics ERROR.
+  bool fields_invalid() const {return fields_validated_ && !fields_valid_;}
+  // True only once deskewing is both configured on and this source's actual
+  // messages were found to carry a usable per-point timestamp field.
+  bool deskew_active() const {return deskew_enabled_ && has_timestamp_field_;}
+
+private:
+  void pc2_callback(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  void scan_callback(sensor_msgs::msg::LaserScan::ConstSharedPtr msg);
+  bool validate_fields(const sensor_msgs::msg::PointCloud2 & msg);
+  void apply_filters(CloudT & cloud);
+  void store_cloud(CloudT::Ptr cloud, const std_msgs::msg::Header & header);
+
+  // Per-point deskewing
+  void detect_timestamp_field(const sensor_msgs::msg::PointCloud2 & msg);
+  // Fill each point's 'time' field with its absolute acquisition time (Unix sec).
+  void populate_point_time(CloudT & cloud, const sensor_msgs::msg::PointCloud2 & raw_msg);
+  void deskew_cloud(CloudT & cloud, const sensor_msgs::msg::PointCloud2 & raw_msg);
+  // Velocity of this sensor's origin, in its own frame, from the odometry twist.
+  // Zero (rotation-only deskew) when the twist or its TF is unavailable.
+  Eigen::Vector3d sensor_velocity(
+    const std::string & sensor_frame, const rclcpp::Time & from, const rclcpp::Time & to);
+  // Rate of child's origin in parent (m/s, parent frame) over a scan-long window,
+  // from the TF chain; T_mid is set to the pose at the window's middle. Zero, with
+  // T_mid untouched, for a static chain or when TF history is missing.
+  Eigen::Vector3d lever_arm_rate(
+    const std::string & parent, const std::string & child,
+    const rclcpp::Time & from, const rclcpp::Time & to, Eigen::Isometry3d & T_mid);
+
+  rclcpp::Node * node_;
+  SourceConfig config_;
+  rclcpp::Logger logger_;
+
+  CloudSubscriber pc2_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+
+  std::shared_ptr<CloudT> buffer_;
+  mutable std::mutex meta_mutex_;
+  rclcpp::Time last_received_time_;
+  std::string frame_id_;
+
+  std::atomic<bool> has_received_{false};
+  std::atomic<uint64_t> message_counter_{0};
+  StatCounters stats_;
+
+  laser_geometry::LaserProjection projector_;
+  bool fields_validated_{false};
+  bool fields_valid_{false};
+  bool missing_intensity_{false};
+
+  std::vector<std::unique_ptr<IFilter>> filters_;
+  bool gpu_filters_{false};
+
+  // Deskewing state
+  ImuGetter get_imu_;
+  TwistGetter get_twist_;
+  TranslationMode translation_{TranslationMode::IMU_ACCEL};
+  bool deskew_enabled_{false};
+  std::string timestamp_field_hint_{"auto"};
+  bool timestamp_field_detected_{false};
+  bool has_timestamp_field_{false};
+  PointTimeDecoder decoder_;
+
+  // Per-source IMU (when configured) and TF for frame rotation
+  std::shared_ptr<ImuBuffer> local_imu_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+};
+
+}  // namespace polka
+
+#endif  // POLKA__INPUT__SOURCE_ADAPTER_HPP_

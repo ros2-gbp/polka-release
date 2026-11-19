@@ -1,0 +1,37 @@
+# ============================================================================
+# polka - articulated platform with per-source IMU deskewing
+# ============================================================================
+# Use this layout when one LiDAR moves relative to the rest of the robot
+# (rotating turret, actuated mast, pan-tilt head, hinged trailer, etc.).
+# Each moving sensor needs its own IMU rigidly bolted to the moving body;
+# fixed sensors share the platform IMU via motion_compensation.imu_topic.
+#
+# TF requirement: robot_state_publisher must publish a live transform from
+# each IMU frame to its sensor frame (dynamic is fine - e.g. from a joint
+# state publisher reading the turret encoder). polka uses that transform
+# to rotate angular velocity and linear acceleration into the sensor frame
+# before deskewing.
+#
+# See config/detailed_params.yaml for every available parameter.
+# ============================================================================
+
+polka:
+  ros__parameters:
+    output_frame_id: "base_link"
+    timestamp_strategy: "latest"
+
+    motion_compensation:
+      enabled: true
+      imu_topic: "/imu/data"          # global / fallback IMU (chassis)
+
+    source_names: ["turret_lidar", "chassis_lidar"]
+
+    sources:
+      # Rotating turret: uses its OWN IMU (bolted to the turret body).
+      turret_lidar:
+        topic: "/turret/points"
+        imu_topic: "/turret/imu/data" # per-source override
+
+      # Fixed chassis LiDAR: no override => uses global /imu/data.
+      chassis_lidar:
+        topic: "/chassis/points"

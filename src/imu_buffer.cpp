@@ -1,0 +1,158 @@
+// Copyright 2025 Panav Arpit Raaj <praajarpit@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "polka/input/imu_buffer.hpp"
+
+#include <Eigen/Geometry>
+
+#include <cmath>
+
+#include "polka/util/log_format.hpp"
+
+namespace polka
+{
+
+ImuBuffer::ImuBuffer(rclcpp::Node * node, const std::string & topic, int buffer_size)
+: topic_(topic), max_size_(buffer_size), logger_(node->get_logger()), clock_(node->get_clock())
+{
+  sub_ = node->create_subscription<sensor_msgs::msg::Imu>(
+    topic, rclcpp::SensorDataQoS(),
+    std::bind(&ImuBuffer::callback, this, std::placeholders::_1));
+  RCLCPP_INFO(
+    logger_, "polka: IMU buffer subscribing to '%s' (capacity %d)",
+    topic.c_str(), buffer_size);
+}
+
+std::shared_ptr<const AveragedImu> ImuBuffer::snapshot() const
+{
+  return std::atomic_load(&snapshot_);
+}
+
+std::shared_ptr<const AveragedImu> ImuBuffer::average(
+  const rclcpp::Time & from, const rclcpp::Time & to) const
+{
+  constexpr int kMinWindowSamples = 2;
+
+  auto avg = std::make_shared<AveragedImu>();
+  int count = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto & s : buffer_) {
+      if (s.stamp.get_clock_type() != from.get_clock_type() || s.stamp < from || s.stamp > to) {
+        continue;
+      }
+      avg->angular_vel += Eigen::Vector3d(s.wx, s.wy, s.wz);
+      avg->linear_accel += Eigen::Vector3d(s.ax, s.ay, s.az);
+      ++count;
+    }
+    avg->frame_id = frame_id_;
+  }
+
+  if (count < kMinWindowSamples) {
+    return snapshot();
+  }
+
+  avg->angular_vel /= count;
+  avg->linear_accel /= count;
+  avg->valid = true;
+  return avg;
+}
+
+rclcpp::Time ImuBuffer::last_stamp() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return last_stamp_;
+}
+
+void ImuBuffer::callback(sensor_msgs::msg::Imu::ConstSharedPtr msg)
+{
+  const auto & a = msg->linear_acceleration;
+  const auto & w = msg->angular_velocity;
+  if (!std::isfinite(a.x) || !std::isfinite(a.y) || !std::isfinite(a.z) ||
+    !std::isfinite(w.x) || !std::isfinite(w.y) || !std::isfinite(w.z))
+  {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, kLogThrottleFastMs,
+      "polka: IMU buffer received non-finite values, ignoring");
+    return;
+  }
+
+  Eigen::Vector3d accel(a.x, a.y, a.z);
+  if (msg->orientation_covariance[0] >= 0.0) {
+    const auto & q = msg->orientation;
+    Eigen::Quaterniond ori(q.w, q.x, q.y, q.z);
+    if (ori.squaredNorm() > 0.5) {
+      ori.normalize();
+      constexpr double kGravity = 9.80665;
+      Eigen::Vector3d g_imu =
+        ori.toRotationMatrix().transpose() * Eigen::Vector3d(0.0, 0.0, kGravity);
+      accel -= g_imu;
+    } else {
+      accel.setZero();
+      RCLCPP_WARN_THROTTLE(
+        logger_, *clock_, kLogThrottleNormalMs,
+        "polka: IMU has degenerate orientation quaternion, translation deskew disabled");
+    }
+  } else {
+    // 无 orientation：用静止比力的 EMA 估计体坐标系重力（静止时 accel ≈ +g_body）
+    constexpr double kGravityEmaAlpha = 0.02;
+    if (!g_body_initialized_) {
+      g_body_ema_ = accel;
+      g_body_initialized_ = true;
+    } else {
+      g_body_ema_ = (1.0 - kGravityEmaAlpha) * g_body_ema_ + kGravityEmaAlpha * accel;
+    }
+    accel -= g_body_ema_;
+    RCLCPP_INFO_ONCE(
+      logger_,
+      "polka: IMU has no orientation, estimating body-frame gravity via EMA");
+  }
+
+  // Remove the gyro bias, learned whenever the sensor stands still.
+  const rclcpp::Time stamp(msg->header.stamp);
+  gyro_bias_.add(stamp, Eigen::Vector3d(w.x, w.y, w.z));
+  const Eigen::Vector3d gyro = Eigen::Vector3d(w.x, w.y, w.z) - gyro_bias_.bias();
+  if (gyro_bias_.learned() && !gyro_bias_reported_) {
+    gyro_bias_reported_ = true;
+    const Eigen::Vector3d b = gyro_bias_.bias() * 1e3;
+    RCLCPP_INFO(
+      logger_, "polka: IMU '%s' gyro bias learned at standstill: (%.2f, %.2f, %.2f) mrad/s",
+      topic_.c_str(), b.x(), b.y(), b.z());
+  }
+
+  ImuSample sample;
+  sample.wx = gyro.x();  sample.wy = gyro.y();  sample.wz = gyro.z();
+  sample.ax = accel.x();  sample.ay = accel.y();  sample.az = accel.z();
+  sample.stamp = stamp;
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    buffer_.push_back(sample);
+    while (static_cast<int>(buffer_.size()) > max_size_) {
+      buffer_.pop_front();
+    }
+    last_stamp_ = sample.stamp;
+    frame_id_ = msg->header.frame_id;
+  }
+  msg_count_.fetch_add(1, std::memory_order_relaxed);
+
+  auto avg = std::make_shared<AveragedImu>();
+  avg->angular_vel = gyro;
+  avg->linear_accel = accel;
+  avg->valid = true;
+  avg->frame_id = msg->header.frame_id;
+  std::atomic_store(&snapshot_, std::const_pointer_cast<const AveragedImu>(avg));
+}
+
+}  // namespace polka
