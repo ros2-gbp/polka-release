@@ -1,0 +1,13 @@
+Source: ros-kilted-polka
+Section: misc
+Priority: optional
+Maintainer: "Panav Arpit Raaj" <praajarpit@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), libeigen3-dev, libpcl-dev, ros-kilted-ament-cmake, ros-kilted-ament-cmake-gtest <!nocheck>, ros-kilted-ament-lint-auto <!nocheck>, ros-kilted-ament-lint-common <!nocheck>, ros-kilted-diagnostic-msgs, ros-kilted-laser-geometry, ros-kilted-nav-msgs, ros-kilted-pcl-conversions, ros-kilted-point-cloud-transport, ros-kilted-rclcpp, ros-kilted-rclcpp-components, ros-kilted-rosbag2-cpp <!nocheck>, ros-kilted-rosbag2-storage-mcap <!nocheck>, ros-kilted-sensor-msgs, ros-kilted-tf2-eigen, ros-kilted-tf2-geometry-msgs, ros-kilted-tf2-msgs <!nocheck>, ros-kilted-tf2-ros, ros-kilted-ros-workspace
+Homepage: https://github.com/Pana1v/polka
+Standards-Version: 3.9.2
+
+Package: ros-kilted-polka
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libeigen3-dev, libpcl-dev, ros-kilted-diagnostic-msgs, ros-kilted-laser-geometry, ros-kilted-nav-msgs, ros-kilted-pcl-conversions, ros-kilted-point-cloud-transport, ros-kilted-rcl-interfaces, ros-kilted-rclcpp, ros-kilted-rclcpp-components, ros-kilted-rclpy, ros-kilted-sensor-msgs, ros-kilted-tf2-eigen, ros-kilted-tf2-geometry-msgs, ros-kilted-tf2-ros, ros-kilted-ros-workspace
+Description: ROS 2 composable node for multi-LiDAR fusion with optional CUDA acceleration.
+ Packages from https://polka-ros.github.io include the CUDA merge engine and fall back to CPU without a GPU; ROS build farm packages are CPU-only.
