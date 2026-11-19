@@ -1,0 +1,13 @@
+Source: ros-humble-polka
+Section: misc
+Priority: optional
+Maintainer: "Panav Arpit Raaj" <praajarpit@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), libeigen3-dev, libpcl-dev, ros-humble-ament-cmake, ros-humble-ament-cmake-gtest <!nocheck>, ros-humble-ament-lint-auto <!nocheck>, ros-humble-ament-lint-common <!nocheck>, ros-humble-diagnostic-msgs, ros-humble-laser-geometry, ros-humble-nav-msgs, ros-humble-pcl-conversions, ros-humble-point-cloud-transport, ros-humble-rclcpp, ros-humble-rclcpp-components, ros-humble-rosbag2-cpp <!nocheck>, ros-humble-rosbag2-storage-mcap <!nocheck>, ros-humble-sensor-msgs, ros-humble-tf2-eigen, ros-humble-tf2-geometry-msgs, ros-humble-tf2-msgs <!nocheck>, ros-humble-tf2-ros, ros-humble-ros-workspace
+Homepage: https://github.com/Pana1v/polka
+Standards-Version: 3.9.2
+
+Package: ros-humble-polka
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libeigen3-dev, libpcl-dev, ros-humble-diagnostic-msgs, ros-humble-laser-geometry, ros-humble-nav-msgs, ros-humble-pcl-conversions, ros-humble-point-cloud-transport, ros-humble-rcl-interfaces, ros-humble-rclcpp, ros-humble-rclcpp-components, ros-humble-rclpy, ros-humble-sensor-msgs, ros-humble-tf2-eigen, ros-humble-tf2-geometry-msgs, ros-humble-tf2-ros, ros-humble-ros-workspace
+Description: ROS 2 composable node for multi-LiDAR fusion with optional CUDA acceleration.
+ Packages from https://polka-ros.github.io include the CUDA merge engine and fall back to CPU without a GPU; ROS build farm packages are CPU-only.
